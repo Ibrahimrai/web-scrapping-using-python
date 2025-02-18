@@ -1,0 +1,116 @@
+import mysql.connector
+import google.generativeai as genai
+import time
+import difflib  # ✅ To find the closest matching category
+
+# MySQL Database Configuration
+DB_CONFIG = {
+    "host": "localhost",
+    "user": "root",
+    "password": "",
+    "database": "researchpaper_db"
+}
+
+# Google Gemini API Configuration
+GENAI_API_KEY = "AIzaSyBQazj9L6ruGkZa2QKV7medxK_IjUgh8mc"
+genai.configure(api_key=GENAI_API_KEY)
+
+# Categories for classification (No "Unknown" allowed)
+CATEGORIES = ["ML", "AI", "Deep Learning", "Computer Vision", "NLP"]
+
+def fetch_papers_without_category():
+    """Fetch papers from the database that do not have a valid category assigned."""
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor(dictionary=True)
+
+    query = "SELECT id, title, abstract FROM research_papers WHERE category IS NULL OR category NOT IN (%s, %s, %s, %s, %s) LIMIT 10"
+    cursor.execute(query, tuple(CATEGORIES))  # Ensure we only fetch unclassified or misclassified papers
+    papers = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+    return papers
+
+def classify_with_gemini(title, abstract):
+    """Send title and abstract to Gemini API and get a category from predefined categories."""
+    prompt = f"""
+    Classify the following research paper strictly into one of these categories:
+    {CATEGORIES}
+
+    Title: {title}
+    Abstract: {abstract}
+
+    Respond with only the most relevant category name from the list above.
+    """
+
+    model = genai.GenerativeModel("gemini-pro")
+    
+    for attempt in range(5):  # Retry up to 5 times
+        try:
+            response = model.generate_content(prompt)
+            if response and hasattr(response, "text") and response.text.strip():
+                category = response.text.strip().split("\n")[-1]  # Extract last line
+                
+                # ✅ Ensure response is one of the 5 categories
+                category = get_closest_category(category)
+                return category
+        except Exception as e:
+            print(f"❌ API Error: {e}")
+            time.sleep(60)
+    
+    return None  # Leave category NULL if classification fails
+
+def get_closest_category(response_category):
+    """Ensure the response is a valid category by finding the closest match."""
+    best_match = difflib.get_close_matches(response_category, CATEGORIES, n=1, cutoff=0.4)
+    return best_match[0] if best_match else None  # Return None instead of forcing a category
+
+def update_category_in_db(paper_id, category):
+    """Update the category for a research_paper in the database."""
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+
+    if category:
+        query = "UPDATE research_papers SET category = %s WHERE id = %s"
+        cursor.execute(query, (category, paper_id))
+    else:
+        print(f"⚠ Paper {paper_id}: Could not classify, leaving category as NULL.")
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def process_papers():
+    """Continuously process unclassified papers until all are categorized."""
+    file_number = 1  # ✅ Start file numbering
+
+    while True:
+        papers = fetch_papers_without_category()
+
+        if not papers:
+            print("✅ All papers are categorized!")
+            break
+
+        for paper in papers:
+            print(f"📄 File {file_number}: Processing '{paper['title']}'")
+
+            if not paper["abstract"]:  # Skip if abstract is missing
+                print(f"⚠ File {file_number}: Skipping due to missing abstract.")
+                file_number += 1
+                continue
+
+            category = classify_with_gemini(paper["title"], paper["abstract"])
+            if category:
+                print(f"✅ File {file_number}: Category Assigned → {category}")
+            else:
+                print(f"⚠ File {file_number}: Could not classify, leaving as NULL.")
+
+            update_category_in_db(paper["id"], category)
+
+            file_number += 1  # ✅ Increment file number
+            time.sleep(10)  # Delay to avoid API rate limits
+
+    print("🎉 Classification process fully completed.")
+
+if __name__ == "__main__":
+    process_papers()
